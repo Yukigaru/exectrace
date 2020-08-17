@@ -3,6 +3,7 @@
 #include <sys/ptrace.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstring> // memcpy
 #include <stdexcept>
 #include <iostream>
 #include <sys/user.h>
@@ -19,15 +20,50 @@ struct ExecveArgs {
     //char *const __envp[];
 };
 
-std::string readProcessPath(pid_t pid, size_t addr) {
+std::ostream & operator <<(std::ostream &os, ExecveArgs &ea) {
+    bool space = false;
+    for (const auto &v : ea.argv) {
+        if (space)
+            os << ' ';
+        os << v;
+        space = true;
+    }
+    return os;
+}
+
+size_t readProcessPointer(pid_t pid, size_t addr) {
+    size_t result = 0;
+    auto *resultPtr = reinterpret_cast<unsigned char *>(&result);
+
+    size_t len = 0;
+    size_t bytesLeft = sizeof(result);
+
+    while (bytesLeft > 0) {
+        auto val = ptrace(PTRACE_PEEKDATA, pid, addr + len);
+        if (errno) {
+            std::cerr << "Failed to peek data from pid " << pid << std::endl;
+            break;
+        }
+
+        memcpy(resultPtr, &val, std::min(sizeof(val), bytesLeft));
+        len += sizeof(val);
+        bytesLeft -= sizeof(val);
+    }
+
+    return result;
+}
+
+std::string readProcessString(pid_t pid, size_t addr) {
     char buf[PATH_MAX] = {0};
     size_t len = 0;
     bool done = false;
 
     while (!done) {
         auto val = ptrace(PTRACE_PEEKDATA, pid, addr + len);
-        if (errno)
+        if (errno) {
+            std::cerr << "Failed to peek data from pid " << pid << std::endl;
             break;
+        }
 
         for (size_t i = 0; i < sizeof(val); i++) {
             char c = *(reinterpret_cast<char *>(&val) + i);
@@ -45,6 +81,21 @@ std::string readProcessPath(pid_t pid, size_t addr) {
     return std::string(buf);
 }
 
+std::vector<std::string> readProcessStrings(pid_t pid, size_t addr) {
+    std::vector<std::string> result;
+    while (true) {
+        size_t v_addr = readProcessPointer(pid, addr);
+        if (!v_addr)
+            break;
+
+        auto s = readProcessString(pid, v_addr);
+        result.push_back(s);
+        addr += sizeof(void *);
+    }
+
+    return result;
+}
+
 ExecveArgs decodeExecve(pid_t pid, user_regs_struct &state) {
     ExecveArgs ret;
 
@@ -56,14 +107,57 @@ ExecveArgs decodeExecve(pid_t pid, user_regs_struct &state) {
     // 4) r8
     // 5) r9
     auto arg0 = static_cast<size_t>(state.rdi);
-    ret.path = readProcessPath(pid, arg0);
+    auto arg1 = static_cast<size_t>(state.rsi);
+    ret.path = readProcessString(pid, arg0);
+    ret.argv = readProcessStrings(pid, arg1);
 
     return ret;
 }
 
+void watchProcess(pid_t pid) {
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL);
+
+    while (true) {
+        int status = 0;
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        waitpid(pid, &status, 0);
+
+        if (WIFEXITED(status))
+            break;
+        if (WIFSTOPPED(status) && WSTOPSIG(status) & 0x80)
+            break;
+
+        user_regs_struct state = {0};
+        ptrace(PTRACE_GETREGS, pid, 0, &state);
+
+        if (state.orig_rax == SYS_vfork) {
+            std::cerr << "forked " << std::endl;
+
+        } else if (state.orig_rax == SYS_fork) {
+            std::cerr << "forked " << std::endl;
+
+        } else if (state.orig_rax == SYS_execve) {
+            ExecveArgs args = decodeExecve(pid, state);
+
+            // ls -l
+            // Process created: ls -l
+            // Pid 1235 created a new process: ls -l
+            // Pid 1235 created a new process child_pid 1235: ls -l
+            // 3123235234: Pid 1235 created a new process child_pid 1235: ls -l
+            std::cerr << "Process created: " << args << std::endl;
+        }
+
+        // skip after syscall
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        waitpid(pid, &status, 0);
+    }
+}
+
 void traceCommand(const char *cmdLine, char *const argv[]) {
-    pid_t pid = fork();
-    if (pid == 0) {
+    pid_t exectrace_pid = getpid();
+
+    pid_t child_pid = fork();
+    if (child_pid == 0) {
         // child
         //char *const argv[] = {nullptr};
         long ret = ptrace(PTRACE_TRACEME, PID_MYSELF, nullptr, nullptr); // TODO: handle ret
@@ -73,40 +167,23 @@ void traceCommand(const char *cmdLine, char *const argv[]) {
         char *const envp[] = {nullptr};
         execve(cmdLine, argv, envp);
 
-    } else if (pid > 0) {
+    } else if (child_pid > 0) {
+        // wait until the child changes its state
         int status;
-        waitpid(pid, &status, 0); // TODO: ret
+        waitpid(child_pid, &status, 0); // TODO: ret
 
-        ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL);
-
+        std::cerr << "Pid " << exectrace_pid << " created pid " << child_pid << ":";
+        size_t idx = 0;
         while (true) {
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
-            waitpid(pid, &status, 0);
-
-            if (WIFEXITED(status))
+            const char *argStr = argv[idx];
+            if (!argStr)
                 break;
-            if (WIFSTOPPED(status) && WSTOPSIG(status) & 0x80)
-                break;
-
-            user_regs_struct state = {0};
-            ptrace(PTRACE_GETREGS, pid, 0, &state);
-
-            if (state.orig_rax == SYS_execve) {
-                ExecveArgs args = decodeExecve(pid, state);
-
-                // ls -l
-                // Process created: ls -l
-                // Pid 1235 created a new process: ls -l
-                // Pid 1235 created a new process pid 1235: ls -l
-                // 3123235234: Pid 1235 created a new process pid 1235: ls -l
-                std::cout << "Process created: " << args.path << std::endl;
-            }
-
-            // skip after syscall
-            ptrace(PTRACE_SYSCALL, pid, 0, 0);
-            waitpid(pid, &status, 0);
+            std::cerr << ' ' << argStr;
+            idx++;
         }
+        std::cerr << std::endl;
 
+        watchProcess(child_pid);
     } else {
         throw std::runtime_error("failed to fork the parent process, errno: " + std::to_string(errno));
     }
